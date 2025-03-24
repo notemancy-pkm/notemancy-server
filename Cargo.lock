@@ -1540,8 +1540,6 @@ dependencies = [
 [[package]]
 name = "notemancy-core"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "243df5705bbb776ca28f85669655e66e533dd268610ac9f2aaa88a357ecb6e69"
 dependencies = [
  "chrono",
  "once_cell",

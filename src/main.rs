@@ -170,6 +170,50 @@ fn note_content(relpath: String) -> Result<Json<NoteContent>, status::Custom<Str
     }
 }
 
+#[derive(Deserialize)]
+#[serde(crate = "rocket::serde")]
+pub struct UpdateNoteRequest {
+    /// The relative path to the note (e.g. "notes/my-note.md")
+    pub relpath: String,
+    /// The complete contents of the note (which may include custom frontmatter or body)
+    pub content: String,
+}
+
+#[post("/notes/update", data = "<note>")]
+fn update_note(
+    note: Json<UpdateNoteRequest>,
+) -> Result<rocket::response::status::Custom<&'static str>, rocket::response::status::Custom<String>>
+{
+    // Read default vault from config folder
+    let config_dir = std::env::var("NOTEMANCY_CONF_DIR").map_err(|e| {
+        rocket::response::status::Custom(
+            rocket::http::Status::InternalServerError,
+            format!("Failed to get config directory: {}", e),
+        )
+    })?;
+
+    let default_vault_path = std::path::Path::new(&config_dir).join("default_vault.txt");
+    let vault_name = match std::fs::read_to_string(&default_vault_path) {
+        Ok(content) => content.trim().to_string(),
+        Err(_) => "main".to_string(), // Fall back to "main" if file doesn't exist
+    };
+
+    let relpath = note.relpath.clone();
+    let content = note.content.clone();
+
+    // Call update_note function from notemancy-core
+    match notemancy_core::crud::update_note(&vault_name, &relpath, &content) {
+        Ok(_) => Ok(rocket::response::status::Custom(
+            rocket::http::Status::Ok,
+            "Note updated",
+        )),
+        Err(e) => Err(rocket::response::status::Custom(
+            rocket::http::Status::InternalServerError,
+            e.to_string(),
+        )),
+    }
+}
+
 #[launch]
 fn rocket() -> _ {
     let allowed_origins = AllowedOrigins::some_exact(&["http://localhost:5173"]);
