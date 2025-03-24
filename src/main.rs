@@ -5,6 +5,7 @@ use chrono::{DateTime, Local};
 use std::fs;
 use std::path::Path;
 
+mod search;
 mod utils;
 
 use rocket::http::Status;
@@ -214,8 +215,40 @@ fn update_note(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(crate = "rocket::serde")]
+pub struct SearchQuery {
+    /// The search query string
+    query: String,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
+pub struct SearchResponse {
+    /// Number of search results
+    pub total: usize,
+    /// The search results
+    pub results: Vec<search::NoteDocument>,
+}
+
+#[get("/notes/search?<query>")]
+async fn search_notes(query: String) -> Result<Json<SearchResponse>, status::Custom<String>> {
+    match search::search_notes_async(&query).await {
+        Ok(result) => Ok(Json(SearchResponse {
+            total: result.hits_count,
+            results: result.hits,
+        })),
+        Err(e) => Err(status::Custom(Status::InternalServerError, e.to_string())),
+    }
+}
+
 #[launch]
-fn rocket() -> _ {
+async fn rocket() -> _ {
+    println!("Building search index...");
+    match search::build_search_index_async("main").await {
+        Ok(_) => println!("Search index built successfully"),
+        Err(e) => eprintln!("Failed to build search index: {}", e),
+    }
     let allowed_origins = AllowedOrigins::some_exact(&["http://localhost:5173"]);
 
     let cors = CorsOptions {
@@ -227,7 +260,15 @@ fn rocket() -> _ {
     .to_cors()
     .expect("error creating CORS fairing");
 
-    rocket::build()
-        .attach(cors)
-        .mount("/", routes![hello, notes_tree, note_content, upload_note])
+    rocket::build().attach(cors).mount(
+        "/",
+        routes![
+            hello,
+            notes_tree,
+            note_content,
+            upload_note,
+            update_note,
+            search_notes
+        ],
+    )
 }

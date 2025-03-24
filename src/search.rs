@@ -1,222 +1,202 @@
 use meilisearch_sdk::client::Client;
-use notemancy_core::config;
-use notemancy_core::crud;
-use notemancy_core::utils;
-use once_cell::sync::OnceCell;
-use rocket::get;
-use rocket::http::Status;
-use rocket::response::status::Custom;
-use rocket::serde::{Serialize, json::Json};
-use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use std::collections::HashSet;
-use std::env;
+use meilisearch_sdk::settings::Settings;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-// Global MeiliSearch client
-static MEILI_CLIENT: OnceCell<Client> = OnceCell::new();
+// Create a static client instance
+static CLIENT: Lazy<Client> = Lazy::new(|| {
+    // The URL and API key should ideally come from configuration
+    Client::new("http://localhost:7700", Some("aSampleMasterKey")).unwrap()
+});
 
-// Document type stored in MeiliSearch
-#[derive(Debug, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDoc {
-    pub id: String,
+// Counter for document IDs
+static COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+const INDEX_NAME: &str = "notes";
+
+/// A document representing a note for indexing in MeiliSearch
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NoteDocument {
+    /// The unique ID for the document in MeiliSearch
+    pub id: usize,
+    /// The relative path to the note file
+    pub relpath: String,
+    /// The title of the note
     pub title: String,
+    /// The content of the note (without frontmatter)
     pub content: String,
-    pub path: String, // For linking to the note
 }
 
-// Search result response structures
-#[derive(Debug, Serialize)]
-#[serde(crate = "rocket::serde")]
+/// A struct for search results
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SearchResult {
-    pub title: String,
-    pub path: String,
-    pub snippet: String,
+    /// The number of hits found
+    pub hits_count: usize,
+    /// The actual note documents found
+    pub hits: Vec<NoteDocument>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(crate = "rocket::serde")]
-pub struct SearchResponse {
-    pub results: Vec<SearchResult>,
-}
+// Asynchronous MeiliSearch functions that will be called by the synchronous wrappers
 
-/// Initializes the MeiliSearch client using environment variables.
-pub fn init_meilisearch() -> Result<(), Box<dyn Error>> {
-    let url = env::var("MEILISEARCH_URL").unwrap_or_else(|_| "http://localhost:7700".to_string());
-    let api_key = env::var("MEILISEARCH_API_KEY").ok();
-
-    let client = Client::new(url, api_key)?;
-    MEILI_CLIENT
-        .set(client)
-        .map_err(|_| "MeiliSearch client already initialized")?;
-
-    println!("MeiliSearch client initialized.");
-    Ok(())
-}
-
-/// Index all notes from the "main" vault into MeiliSearch using list_notes and read_note.
-pub async fn index_all_notes() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let client = MEILI_CLIENT
-        .get()
-        .ok_or("MeiliSearch client not initialized")?;
-    let index = client.index("notes");
-
-    // Configure index settings
-    if let Err(e) = index.set_searchable_attributes(&["title", "content"]).await {
-        eprintln!("Failed to set searchable attributes: {}", e);
-    }
-    if let Err(e) = index.set_filterable_attributes(&["id", "path"]).await {
-        eprintln!("Failed to set filterable attributes: {}", e);
+/// Configuration for MeiliSearch - async version
+pub async fn configure_meilisearch_async() -> Result<(), Box<dyn Error>> {
+    // Create the index if it doesn't exist
+    if let Err(_) = CLIENT.get_index(INDEX_NAME).await {
+        CLIENT.create_index(INDEX_NAME, Some("id")).await?;
     }
 
-    // Get existing document IDs from MeiliSearch
-    let existing_docs = index.get_documents::<NoteDoc>().await?;
-    let existing_ids: HashSet<String> = existing_docs
-        .results
-        .into_iter()
-        .map(|doc| doc.id)
-        .collect();
+    // Configure the index settings
+    let settings = Settings::new()
+        .with_searchable_attributes(&["title", "content", "relpath"])
+        .with_displayed_attributes(&["id", "relpath", "title", "content"])
+        .with_filterable_attributes(&["relpath"])
+        .with_ranking_rules(&[
+            "words",
+            "typo",
+            "proximity",
+            "attribute",
+            "sort",
+            "exactness",
+        ]);
 
-    // List all notes using list_notes; convert errors so they are Send+Sync.
-    let notes = utils::list_notes("main")
-        .map_err(|e| Box::<dyn Error + Send + Sync>::from(e.to_string()))?;
+    let task = CLIENT
+        .index(INDEX_NAME)
+        .set_settings(&settings)
+        .await?
+        .wait_for_completion(&CLIENT, None, Some(Duration::from_secs(60)))
+        .await?;
 
-    // Get the vault directory (unused here, but available if needed)
-    let _vault_dir = config::get_vault_dir("main")
-        .map_err(|e| Box::<dyn Error + Send + Sync>::from(e.to_string()))?;
-
-    let mut to_index = Vec::new();
-    for note in notes {
-        // Skip if already indexed (using note.relpath as the unique id)
-        if existing_ids.contains(&note.relpath) {
-            continue;
-        }
-        // Read note content without YAML frontmatter.
-        let content = crud::read_note("main", &note.relpath, false)
-            .map_err(|e| Box::<dyn Error + Send + Sync>::from(e.to_string()))?;
-        let path = note.relpath.clone();
-        to_index.push(NoteDoc {
-            id: note.relpath.clone(),
-            title: note.title.clone(),
-            content,
-            path,
-        });
-    }
-
-    if !to_index.is_empty() {
-        index.add_documents(&to_index, Some("id")).await?;
-        println!("Indexed {} notes into MeiliSearch", to_index.len());
-    } else {
-        println!("No new notes to index");
+    if task.is_failure() {
+        return Err(format!("Failed to configure index: {:?}", task.unwrap_failure()).into());
     }
 
     Ok(())
 }
 
-/// Extract a snippet from the text based on the query for display in search results.
-fn extract_snippet(text: &str, query: &str) -> String {
-    let lower_text = text.to_lowercase();
-    let words: Vec<&str> = query.split_whitespace().collect();
-    let mut best_index: Option<usize> = None;
+/// Add or update a note in the search index - async version
+pub async fn index_note_async(note: &NoteDocument) -> Result<(), Box<dyn Error>> {
+    let task = CLIENT
+        .index(INDEX_NAME)
+        .add_documents(&[note.clone()], Some("id"))
+        .await?
+        .wait_for_completion(&CLIENT, None, Some(Duration::from_secs(60)))
+        .await?;
 
-    for word in words {
-        if let Some(idx) = lower_text.find(&word.to_lowercase()) {
-            best_index = match best_index {
-                Some(current) => Some(std::cmp::min(current, idx)),
-                None => Some(idx),
-            };
-        }
+    if task.is_failure() {
+        return Err(format!("Failed to index note: {:?}", task.unwrap_failure()).into());
     }
 
-    if let Some(pos) = best_index {
-        let start = if pos > 50 { pos - 50 } else { 0 };
-        let end = std::cmp::min(text.len(), pos + 50);
-        format!("...{}...", text[start..end].trim())
-    } else {
-        text.chars().take(100).collect()
-    }
+    Ok(())
 }
 
-/// GET /notes/search?q=your+query - performs a search using MeiliSearch.
-#[get("/notes/search?<q>")]
-pub async fn search_notes(q: &str) -> Result<Json<SearchResponse>, Custom<String>> {
-    let client = MEILI_CLIENT.get().ok_or_else(|| {
-        Custom(
-            Status::InternalServerError,
-            "MeiliSearch client not initialized".to_string(),
-        )
-    })?;
-    let index = client.index("notes");
+/// Add or update multiple notes in the search index - async version
+pub async fn index_notes_async(notes: &[NoteDocument]) -> Result<(), Box<dyn Error>> {
+    if notes.is_empty() {
+        return Ok(());
+    }
 
-    let search_results = index
+    let task = CLIENT
+        .index(INDEX_NAME)
+        .add_documents(notes, Some("id"))
+        .await?
+        .wait_for_completion(&CLIENT, None, Some(Duration::from_secs(60)))
+        .await?;
+
+    if task.is_failure() {
+        return Err(format!("Failed to index notes: {:?}", task.unwrap_failure()).into());
+    }
+
+    Ok(())
+}
+
+/// Search notes by exact relpath - async version
+pub async fn search_by_relpath_async(relpath: &str) -> Result<SearchResult, Box<dyn Error>> {
+    let results = CLIENT
+        .index(INDEX_NAME)
         .search()
-        .with_query(q)
-        .with_highlight_pre_tag("<em>")
-        .with_highlight_post_tag("</em>")
-        .with_limit(10)
-        .execute::<NoteDoc>()
-        .await
-        .map_err(|e| {
-            Custom(
-                Status::InternalServerError,
-                format!("Search failed: {:?}", e),
-            )
-        })?;
+        .with_filter(&format!("relpath = '{}'", relpath.replace("'", "\\'")))
+        .execute::<NoteDocument>()
+        .await?;
 
-    let results = search_results
-        .hits
-        .into_iter()
-        .map(|hit| {
-            let snippet = if let Some(formatted) = hit.formatted_result {
-                if let Some(content) = formatted.get("content") {
-                    content.to_string()
-                } else {
-                    extract_snippet(&hit.result.content, q)
-                }
-            } else {
-                extract_snippet(&hit.result.content, q)
-            };
-
-            SearchResult {
-                title: hit.result.title,
-                path: hit.result.path,
-                snippet,
-            }
-        })
-        .collect();
-
-    Ok(Json(SearchResponse { results }))
+    Ok(SearchResult {
+        hits_count: results.hits.len(),
+        hits: results.hits.into_iter().map(|hit| hit.result).collect(),
+    })
 }
 
-/// Update a note document in the MeiliSearch index.
-pub async fn update_search_index(
-    id: &str,
-    title: &str,
-    path: &str,
-    content: &str,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let client = MEILI_CLIENT
-        .get()
-        .ok_or("MeiliSearch client not initialized")?;
-    let index = client.index("notes");
+/// Delete a note from the search index by its relpath - async version
+pub async fn delete_note_from_index_async(relpath: &str) -> Result<(), Box<dyn Error>> {
+    // First we need to find the document by its relpath
+    let search_results = search_by_relpath_async(relpath).await?;
 
-    let doc = NoteDoc {
-        id: id.to_string(),
-        title: title.to_string(),
-        content: content.to_string(),
-        path: path.to_string(),
-    };
+    if search_results.hits.is_empty() {
+        // Note not found in index, nothing to delete
+        return Ok(());
+    }
 
-    index.add_documents(&[doc], Some("id")).await?;
+    // Delete each document that matches the relpath
+    for doc in search_results.hits {
+        let task = CLIENT
+            .index(INDEX_NAME)
+            .delete_document(doc.id)
+            .await?
+            .wait_for_completion(&CLIENT, None, Some(Duration::from_secs(60)))
+            .await?;
+
+        if task.is_failure() {
+            return Err(format!("Failed to delete note: {:?}", task.unwrap_failure()).into());
+        }
+    }
+
     Ok(())
 }
 
-/// Delete a note document from the MeiliSearch index.
-pub async fn delete_from_search_index(id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let client = MEILI_CLIENT
-        .get()
-        .ok_or("MeiliSearch client not initialized")?;
-    let index = client.index("notes");
+/// Search notes by query string - async version
+pub async fn search_notes_async(query: &str) -> Result<SearchResult, Box<dyn Error>> {
+    let results = CLIENT
+        .index(INDEX_NAME)
+        .search()
+        .with_query(query)
+        .execute::<NoteDocument>()
+        .await?;
 
-    index.delete_document(id).await?;
+    Ok(SearchResult {
+        hits_count: results.hits.len(),
+        hits: results.hits.into_iter().map(|hit| hit.result).collect(),
+    })
+}
+
+/// Build the search index from all notes in the vault - async version
+pub async fn build_search_index_async(vault_name: &str) -> Result<(), Box<dyn Error>> {
+    // Configure MeiliSearch first
+    configure_meilisearch_async().await?;
+
+    // Get all notes from the vault
+    let notes = notemancy_core::utils::list_notes(vault_name)?;
+
+    // Create documents for each note
+    let mut documents = Vec::new();
+    for note_info in notes {
+        let content = notemancy_core::crud::read_note(vault_name, &note_info.relpath, false)?;
+        let document = NoteDocument {
+            id: COUNTER.fetch_add(1, Ordering::SeqCst),
+            relpath: note_info.relpath.clone(),
+            title: note_info.title,
+            content,
+        };
+        documents.push(document);
+    }
+
+    // Index all documents
+    index_notes_async(&documents).await?;
+
     Ok(())
+}
+
+/// Get a new unique ID for a document
+pub fn get_new_id() -> usize {
+    COUNTER.fetch_add(1, Ordering::SeqCst)
 }

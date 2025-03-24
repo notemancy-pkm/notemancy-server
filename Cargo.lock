@@ -1554,6 +1554,7 @@ name = "notemancy-server"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "meilisearch-sdk",
  "notemancy-core",
  "once_cell",
@@ -2873,6 +2874,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
